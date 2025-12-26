@@ -7,11 +7,14 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
-	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
+	"github.com/mark3labs/mcp-go/client/transport"
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
@@ -19,21 +22,41 @@ func compileTestServer(outputPath string) error {
 	cmd := exec.Command(
 		"go",
 		"build",
+		"-buildmode=pie",
 		"-o",
 		outputPath,
 		"../testdata/mockstdio_server.go",
 	)
+	tmpCache, _ := os.MkdirTemp("", "gocache")
+	cmd.Env = append(os.Environ(), "GOCACHE="+tmpCache)
+
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("compilation failed: %v\nOutput: %s", err, output)
+	}
+	// Verify the binary was actually created
+	if _, err := os.Stat(outputPath); os.IsNotExist(err) {
+		return fmt.Errorf("mock server binary not found at %s after compilation", outputPath)
 	}
 	return nil
 }
 
 func TestStdioMCPClient(t *testing.T) {
-	// Compile mock server
-	mockServerPath := filepath.Join(os.TempDir(), "mockstdio_server")
-	if err := compileTestServer(mockServerPath); err != nil {
-		t.Fatalf("Failed to compile mock server: %v", err)
+	// Create a temporary file for the mock server
+	tempFile, err := os.CreateTemp("", "mockstdio_server")
+	if err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	tempFile.Close()
+	mockServerPath := tempFile.Name()
+
+	// Add .exe suffix on Windows
+	if runtime.GOOS == "windows" {
+		os.Remove(mockServerPath) // Remove the empty file first
+		mockServerPath += ".exe"
+	}
+
+	if compileErr := compileTestServer(mockServerPath); compileErr != nil {
+		t.Fatalf("Failed to compile mock server: %v", compileErr)
 	}
 	defer os.Remove(mockServerPath)
 
@@ -47,7 +70,13 @@ func TestStdioMCPClient(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		dec := json.NewDecoder(client.Stderr())
+
+		stderr, ok := GetStderr(client)
+		if !ok {
+			return
+		}
+
+		dec := json.NewDecoder(stderr)
 		for {
 			var record map[string]any
 			if err := dec.Decode(&record); err != nil {
@@ -64,7 +93,7 @@ func TestStdioMCPClient(t *testing.T) {
 		defer cancel()
 
 		request := mcp.InitializeRequest{}
-		request.Params.ProtocolVersion = "1.0"
+		request.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
 		request.Params.ClientInfo = mcp.Implementation{
 			Name:    "test-client",
 			Version: "1.0.0",
@@ -206,7 +235,7 @@ func TestStdioMCPClient(t *testing.T) {
 
 		request := mcp.CallToolRequest{}
 		request.Params.Name = "test-tool"
-		request.Params.Arguments = map[string]interface{}{
+		request.Params.Arguments = map[string]any{
 			"param1": "value1",
 		}
 
@@ -278,4 +307,44 @@ func TestStdioMCPClient(t *testing.T) {
 			t.Errorf("Expected log message 'launch successful', got '%s'", msg)
 		}
 	})
+}
+
+func TestStdio_NewStdioMCPClientWithOptions_CreatesAndStartsClient(t *testing.T) {
+	called := false
+
+	fakeCmdFunc := func(ctx context.Context, command string, args []string, env []string) (*exec.Cmd, error) {
+		called = true
+		return exec.CommandContext(ctx, "echo", "started"), nil
+	}
+
+	client, err := NewStdioMCPClientWithOptions(
+		"echo",
+		[]string{"FOO=bar"},
+		[]string{"hello"},
+		transport.WithCommandFunc(fakeCmdFunc),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, client)
+	t.Cleanup(func() {
+		_ = client.Close()
+	})
+	require.True(t, called)
+}
+
+func TestStdio_NewStdioMCPClientWithOptions_FailsToStart(t *testing.T) {
+	// Create a commandFunc that points to a nonexistent binary
+	badCmdFunc := func(ctx context.Context, command string, args []string, env []string) (*exec.Cmd, error) {
+		return exec.CommandContext(ctx, "/nonexistent/bar", args...), nil
+	}
+
+	client, err := NewStdioMCPClientWithOptions(
+		"foo",
+		nil,
+		nil,
+		transport.WithCommandFunc(badCmdFunc),
+	)
+
+	require.Error(t, err)
+	require.EqualError(t, err, "failed to start stdio transport: failed to start command: fork/exec /nonexistent/bar: no such file or directory")
+	require.Nil(t, client)
 }

@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"flag"
 	"fmt"
 	"log"
+	"strconv"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -44,6 +46,11 @@ func NewMCPServer() *server.MCPServer {
 	hooks.AddBeforeInitialize(func(ctx context.Context, id any, message *mcp.InitializeRequest) {
 		fmt.Printf("beforeInitialize: %v, %v\n", id, message)
 	})
+	hooks.AddOnRequestInitialization(func(ctx context.Context, id any, message any) error {
+		fmt.Printf("AddOnRequestInitialization: %v, %v\n", id, message)
+		// authorization verification and other preprocessing tasks are performed.
+		return nil
+	})
 	hooks.AddAfterInitialize(func(ctx context.Context, id any, message *mcp.InitializeRequest, result *mcp.InitializeResult) {
 		fmt.Printf("afterInitialize: %v, %v, %v\n", id, message, result)
 	})
@@ -59,6 +66,7 @@ func NewMCPServer() *server.MCPServer {
 		"1.0.0",
 		server.WithResourceCapabilities(true, true),
 		server.WithPromptCapabilities(true),
+		server.WithToolCapabilities(true),
 		server.WithLogging(),
 		server.WithHooks(hooks),
 	)
@@ -66,6 +74,7 @@ func NewMCPServer() *server.MCPServer {
 	mcpServer.AddResource(mcp.NewResource("test://static/resource",
 		"Static Resource",
 		mcp.WithMIMEType("text/plain"),
+		mcp.WithResourceIcons(mcp.Icon{Src: "https://example.com/icon.png", MIMEType: "image/png"}),
 	), handleReadResource)
 	mcpServer.AddResourceTemplate(
 		mcp.NewResourceTemplate(
@@ -74,8 +83,15 @@ func NewMCPServer() *server.MCPServer {
 		),
 		handleResourceTemplate,
 	)
+
+	resources := generateResources()
+	for _, resource := range resources {
+		mcpServer.AddResource(resource, handleGeneratedResource)
+	}
+
 	mcpServer.AddPrompt(mcp.NewPrompt(string(SIMPLE),
 		mcp.WithPromptDescription("A simple prompt"),
+		mcp.WithPromptIcons(mcp.Icon{Src: "https://example.com/prompt.png"}),
 	), handleSimplePrompt)
 	mcpServer.AddPrompt(mcp.NewPrompt(string(COMPLEX),
 		mcp.WithPromptDescription("A complex prompt"),
@@ -94,6 +110,7 @@ func NewMCPServer() *server.MCPServer {
 			mcp.Description("Message to echo"),
 			mcp.Required(),
 		),
+		mcp.WithToolIcons(mcp.Icon{Src: "https://example.com/tool.png", Sizes: []string{"32x32"}}),
 	), handleEchoTool)
 
 	mcpServer.AddTool(
@@ -132,12 +149,12 @@ func NewMCPServer() *server.MCPServer {
 	// 	Description: "Samples from an LLM using MCP's sampling feature",
 	// 	InputSchema: mcp.ToolInputSchema{
 	// 		Type: "object",
-	// 		Properties: map[string]interface{}{
-	// 			"prompt": map[string]interface{}{
+	// 		Properties: map[string]any{
+	// 			"prompt": map[string]any{
 	// 				"type":        "string",
 	// 				"description": "The prompt to send to the LLM",
 	// 			},
-	// 			"maxTokens": map[string]interface{}{
+	// 			"maxTokens": map[string]any{
 	// 				"type":        "number",
 	// 				"description": "Maximum number of tokens to generate",
 	// 				"default":     100,
@@ -151,7 +168,39 @@ func NewMCPServer() *server.MCPServer {
 
 	mcpServer.AddNotificationHandler("notification", handleNotification)
 
+	mcpServer.AddTool(mcp.NewTool("get_resource_link",
+		mcp.WithDescription("Returns a resource link example"),
+		mcp.WithString("resource_type",
+			mcp.Description("Type of resource to link to"),
+			mcp.DefaultString("document")),
+	), handleGetResourceLinkTool)
+
 	return mcpServer
+}
+
+func handleGetResourceLinkTool(
+	ctx context.Context,
+	request mcp.CallToolRequest,
+) (*mcp.CallToolResult, error) {
+	resourceType := request.GetString("resource_type", "document")
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{
+			mcp.TextContent{
+				Type: "text",
+				Text: fmt.Sprintf("Here's a link to a %s resource:", resourceType),
+			},
+			mcp.NewResourceLink(
+				fmt.Sprintf("file:///example/%s.pdf", resourceType),
+				fmt.Sprintf("Sample %s", resourceType),
+				fmt.Sprintf("A sample %s for demonstration", resourceType),
+				"application/pdf",
+			),
+			mcp.TextContent{
+				Type: "text",
+				Text: "You can access this resource using the provided URI.",
+			},
+		},
+	}, nil
 }
 
 func generateResources() []mcp.Resource {
@@ -173,27 +222,6 @@ func generateResources() []mcp.Resource {
 		}
 	}
 	return resources
-}
-
-func runUpdateInterval() {
-	// for range s.updateTicker.C {
-	// 	for uri := range s.subscriptions {
-	// 		s.server.HandleMessage(
-	// 			context.Background(),
-	// 			mcp.JSONRPCNotification{
-	// 				JSONRPC: mcp.JSONRPC_VERSION,
-	// 				Notification: mcp.Notification{
-	// 					Method: "resources/updated",
-	// 					Params: struct {
-	// 						Meta map[string]interface{} `json:"_meta,omitempty"`
-	// 					}{
-	// 						Meta: map[string]interface{}{"uri": uri},
-	// 					},
-	// 				},
-	// 			},
-	// 		)
-	// 	}
-	// }
 }
 
 func handleReadResource(
@@ -220,6 +248,43 @@ func handleResourceTemplate(
 			Text:     "This is a sample resource",
 		},
 	}, nil
+}
+
+func handleGeneratedResource(
+	ctx context.Context,
+	request mcp.ReadResourceRequest,
+) ([]mcp.ResourceContents, error) {
+	uri := request.Params.URI
+
+	var resourceNumber string
+	if _, err := fmt.Sscanf(uri, "test://static/resource/%s", &resourceNumber); err != nil {
+		return nil, fmt.Errorf("invalid resource URI format: %w", err)
+	}
+
+	num, err := strconv.Atoi(resourceNumber)
+	if err != nil {
+		return nil, fmt.Errorf("invalid resource number: %w", err)
+	}
+
+	index := num - 1
+
+	if index%2 == 0 {
+		return []mcp.ResourceContents{
+			mcp.TextResourceContents{
+				URI:      uri,
+				MIMEType: "text/plain",
+				Text:     fmt.Sprintf("Text content for resource %d", num),
+			},
+		}, nil
+	} else {
+		return []mcp.ResourceContents{
+			mcp.BlobResourceContents{
+				URI:      uri,
+				MIMEType: "application/octet-stream",
+				Blob:     base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("Binary content for resource %d", num))),
+			},
+		}, nil
+	}
 }
 
 func handleSimplePrompt(
@@ -282,7 +347,7 @@ func handleEchoTool(
 	ctx context.Context,
 	request mcp.CallToolRequest,
 ) (*mcp.CallToolResult, error) {
-	arguments := request.Params.Arguments
+	arguments := request.GetArguments()
 	message, ok := arguments["message"].(string)
 	if !ok {
 		return nil, fmt.Errorf("invalid message argument")
@@ -301,7 +366,7 @@ func handleAddTool(
 	ctx context.Context,
 	request mcp.CallToolRequest,
 ) (*mcp.CallToolResult, error) {
-	arguments := request.Params.Arguments
+	arguments := request.GetArguments()
 	a, ok1 := arguments["a"].(float64)
 	b, ok2 := arguments["b"].(float64)
 	if !ok1 || !ok2 {
@@ -328,7 +393,7 @@ func handleSendNotification(
 	err := server.SendNotificationToClient(
 		ctx,
 		"notifications/progress",
-		map[string]interface{}{
+		map[string]any{
 			"progress":      10,
 			"total":         10,
 			"progressToken": 0,
@@ -352,7 +417,7 @@ func handleLongRunningOperationTool(
 	ctx context.Context,
 	request mcp.CallToolRequest,
 ) (*mcp.CallToolResult, error) {
-	arguments := request.Params.Arguments
+	arguments := request.GetArguments()
 	progressToken := request.Params.Meta.ProgressToken
 	duration, _ := arguments["duration"].(float64)
 	steps, _ := arguments["steps"].(float64)
@@ -362,15 +427,19 @@ func handleLongRunningOperationTool(
 	for i := 1; i < int(steps)+1; i++ {
 		time.Sleep(time.Duration(stepDuration * float64(time.Second)))
 		if progressToken != nil {
-			server.SendNotificationToClient(
+			err := server.SendNotificationToClient(
 				ctx,
 				"notifications/progress",
-				map[string]interface{}{
+				map[string]any{
 					"progress":      i,
 					"total":         int(steps),
 					"progressToken": progressToken,
+					"message":       fmt.Sprintf("Server progress %v%%", int(float64(i)*100/steps)),
 				},
 			)
+			if err != nil {
+				return nil, fmt.Errorf("failed to send notification: %w", err)
+			}
 		}
 	}
 
@@ -388,7 +457,7 @@ func handleLongRunningOperationTool(
 	}, nil
 }
 
-// func (s *MCPServer) handleSampleLLMTool(arguments map[string]interface{}) (*mcp.CallToolResult, error) {
+// func (s *MCPServer) handleSampleLLMTool(arguments map[string]any) (*mcp.CallToolResult, error) {
 // 	prompt, _ := arguments["prompt"].(string)
 // 	maxTokens, _ := arguments["maxTokens"].(float64)
 
@@ -400,7 +469,7 @@ func handleLongRunningOperationTool(
 // 	)
 
 // 	return &mcp.CallToolResult{
-// 		Content: []interface{}{
+// 		Content: []any{
 // 			mcp.TextContent{
 // 				Type: "text",
 // 				Text: fmt.Sprintf("LLM sampling result: %s", result),
@@ -441,17 +510,17 @@ func handleNotification(
 
 func main() {
 	var transport string
-	flag.StringVar(&transport, "t", "stdio", "Transport type (stdio or sse)")
-	flag.StringVar(&transport, "transport", "stdio", "Transport type (stdio or sse)")
+	flag.StringVar(&transport, "t", "stdio", "Transport type (stdio or http)")
+	flag.StringVar(&transport, "transport", "stdio", "Transport type (stdio or http)")
 	flag.Parse()
 
 	mcpServer := NewMCPServer()
 
-	// Only check for "sse" since stdio is the default
-	if transport == "sse" {
-		sseServer := server.NewSSEServer(mcpServer, server.WithBaseURL("http://localhost:8080"))
-		log.Printf("SSE server listening on :8080")
-		if err := sseServer.Start(":8080"); err != nil {
+	// Only check for "http" since stdio is the default
+	if transport == "http" {
+		httpServer := server.NewStreamableHTTPServer(mcpServer)
+		log.Printf("HTTP server listening on :8080/mcp")
+		if err := httpServer.Start(":8080"); err != nil {
 			log.Fatalf("Server error: %v", err)
 		}
 	} else {
